@@ -1,5 +1,6 @@
 // 视频流类型枚举
 export enum StreamType {
+  AUTO = 'auto',
   WEBRTC = 'webrtc',
   ZLM_RTC = 'zlm_rtc',
   RTMP = 'rtmp',
@@ -26,13 +27,27 @@ export interface PlayerConfig {
   autoplay?: boolean
   muted?: boolean
   controls?: boolean
+  showControls?: boolean
   width?: number | string
   height?: number | string
   poster?: string
+  bufferSize?: number
+  streams?: StreamConfig[]
   // 多视频流配置
   multiStream?: MultiStreamConfig
   // 是否启用多流模式
   enableMultiStream?: boolean
+  // 控制栏配置
+  controlsConfig?: ControlsConfig
+}
+
+export interface ControlsConfig {
+  showPlay?: boolean
+  showVolume?: boolean
+  showFullscreen?: boolean
+  showScreenshot?: boolean
+  showStreamSelector?: boolean
+  showFrameExtract?: boolean
 }
 
 // 播放器事件接口

@@ -4,11 +4,11 @@
       <!-- 视频播放区域 -->
       <video
         ref="videoElement"
-        :width="config.width"
-        :height="config.height"
-        :poster="config.poster"
-        :muted="config.muted"
-        :autoplay="config.autoplay"
+        :width="globalConfig.defaultWidth"
+        :height="globalConfig.defaultHeight"
+        :poster="availableStreams.find(s => s.id === currentStreamId)?.poster"
+        :muted="globalConfig.muted"
+        :autoplay="globalConfig.autoplay"
         :controls="false"
         playsinline
         webkit-playsinline
@@ -35,19 +35,25 @@
         <button @click="retry" class="retry-button">重试</button>
       </div>
       
+      <!-- Custom Overlay Slot -->
+      <div class="custom-overlay">
+        <slot name="overlay" :status="status" :current-time="currentTime"></slot>
+      </div>
+
       <!-- 控制栏 -->
       <div v-if="showControls" class="controls-bar" :class="{ 'controls-visible': controlsVisible }">
         <div class="controls-left">
-          <button @click="togglePlay" class="control-button">
+          <slot name="controls-left"></slot>
+          <button v-if="finalControlsConfig.showPlay" @click="togglePlay" class="control-button">
             {{ status === PlayerStatus.PLAYING ? '⏸️' : '▶️' }}
           </button>
-          <button @click="stop" class="control-button">⏹️</button>
-          <button @click="refresh" class="control-button">🔄</button>
+          <button v-if="finalControlsConfig.showPlay" @click="stop" class="control-button">⏹️</button>
+          <button v-if="finalControlsConfig.showPlay" @click="refresh" class="control-button">🔄</button>
           <span class="time-display">{{ formatTime(currentTime) }}</span>
         </div>
         
         <div class="controls-center">
-          <div class="volume-control">
+          <div v-if="finalControlsConfig.showVolume" class="volume-control">
             <button @click="toggleMute" class="control-button">
               {{ isMuted ? '🔇' : '🔊' }}
             </button>
@@ -65,7 +71,7 @@
         
         <div class="controls-right">
           <!-- 视频流切换控件 -->
-          <div v-if="isMultiStreamMode && availableStreams.length > 1" class="stream-selector">
+          <div v-if="isMultiStreamMode && availableStreams.length > 1 && finalControlsConfig.showStreamSelector" class="stream-selector">
             <select 
               v-model="currentStreamId" 
               @change="handleStreamChange"
@@ -81,11 +87,12 @@
               </option>
             </select>
           </div>
-          <button @click="screenshot" class="control-button" title="截图">📷</button>
-          <button @click="toggleFrameExtract" class="control-button" title="抽帧">
+          <button v-if="finalControlsConfig.showScreenshot" @click="screenshot" class="control-button" title="截图">📷</button>
+          <button v-if="finalControlsConfig.showFrameExtract" @click="toggleFrameExtract" class="control-button" title="抽帧">
             {{ isExtracting ? '⏹️' : '🎞️' }}
           </button>
-          <button @click="toggleFullscreen" class="control-button">⛶</button>
+          <button v-if="finalControlsConfig.showFullscreen" @click="toggleFullscreen" class="control-button">⛶</button>
+          <slot name="controls-right"></slot>
         </div>
       </div>
     </div>
@@ -93,16 +100,24 @@
     <!-- 统计信息 -->
     <div v-if="showStats" class="stats-panel">
       <div class="stats-item">状态: {{ status }}</div>
-      <div class="stats-item">类型: {{ config.type }}</div>
+      <div class="stats-item">类型: {{ availableStreams.find(s => s.id === currentStreamId)?.type }}</div>
       <div class="stats-item" v-if="stats.bitrate">码率: {{ stats.bitrate }}kbps</div>
       <div class="stats-item" v-if="stats.fps">帧率: {{ stats.fps }}fps</div>
       <div class="stats-item" v-if="stats.resolution">
         分辨率: {{ stats.resolution.width }}x{{ stats.resolution.height }}
       </div>
+      <div class="stats-item" v-if="monitoringEnabled">连接状态: {{ connectionState }}</div>
+      <div class="stats-item" v-if="monitoringEnabled && globalMonitor.getReport(currentStreamId).errorCount > 0">
+        错误次数: {{ globalMonitor.getReport(currentStreamId).errorCount }}
+      </div>
     </div>
     
     <!-- 视频流轮播组件 -->
-    <div v-if="isMultiStreamMode && availableStreams.length > 1" class="stream-carousel">
+    <div 
+      v-if="isMultiStreamMode && availableStreams.length > 1" 
+      class="stream-carousel"
+      :class="{ 'carousel-visible': controlsVisible }"
+    >
       <div class="carousel-container">
         <button 
           class="carousel-nav carousel-prev" 
@@ -148,18 +163,18 @@
                   <div class="loading-spinner-small"></div>
                 </div>
                 
-                <!-- 播放状态指示器 -->
-                <div v-if="stream.id === currentStreamId" class="play-indicator">
-                  <div class="play-icon">▶</div>
+                <!-- 播放指示器 -->
+                <div v-if="stream.id === currentStreamId && status === PlayerStatus.PLAYING" class="play-indicator">
+                  ▶
                 </div>
-              </div>
-              
-              <div class="stream-info">
-                <div class="stream-name">{{ stream.name }}</div>
-                <div class="stream-status">
+                
+                <!-- 状态显示 -->
+                <div class="thumbnail-status">
                   {{ getStreamStatus(stream.id) }}
                 </div>
               </div>
+              
+              <div class="thumbnail-name">{{ stream.name }}</div>
             </div>
           </div>
         </div>
@@ -188,7 +203,8 @@ import {
   PlaybackStats,
   IPlayer,
   StreamConfig,
-  MultiStreamConfig
+  MultiStreamConfig,
+  ControlsConfig
 } from '@/types'
 import { 
   formatTime, 
@@ -196,20 +212,63 @@ import {
   canvasToBlob, 
   downloadFile, 
   loadScript,
+  detectStreamType,
   debounce
 } from '@/utils'
 
+// 新增导入
+import { playerConfigManager, getGlobalConfig, createMultiStreamConfig } from '@/config/playerConfig'
+import { globalMonitor, startMonitoring, stopMonitoring, recordError } from '@/utils/playerMonitor'
+import { createStandardReconnect, ConnectionState } from '@/utils/reconnectManager'
+
 interface Props {
-  config: PlayerConfig
+  // 简化props，统一使用多流配置
+  streams?: Array<{
+    id: string
+    name: string
+    url: string
+    type?: StreamType
+    poster?: string
+  }>
+  preset?: string // 预设配置名称
   events?: PlayerEvents
   showControls?: boolean
   showStats?: boolean
+  enableMonitoring?: boolean
+  enableAutoReconnect?: boolean
+  controlsConfig?: ControlsConfig
 }
 
 const props = withDefaults(defineProps<Props>(), {
+  preset: 'multiStream',
   showControls: true,
-  showStats: false
+  showStats: false,
+  enableMonitoring: true,
+  enableAutoReconnect: true,
+  controlsConfig: () => ({})
 })
+
+const emit = defineEmits<{
+  (e: 'play'): void
+  (e: 'pause'): void
+  (e: 'stop'): void
+  (e: 'error', error: Error): void
+  (e: 'loadStart'): void
+  (e: 'loadEnd'): void
+  (e: 'timeUpdate', time: number): void
+  (e: 'volumeChange', volume: number): void
+  (e: 'streamSwitch', streamId: string, stream?: StreamConfig): void
+}>()
+
+const finalControlsConfig = computed(() => ({
+  showPlay: true,
+  showVolume: true,
+  showFullscreen: true,
+  showScreenshot: true,
+  showStreamSelector: true,
+  showFrameExtract: true,
+  ...props.controlsConfig
+}))
 
 // 响应式数据
 const playerContainer = ref<HTMLElement>()
@@ -226,7 +285,7 @@ const stats = reactive<PlaybackStats>({})
 // 多视频流相关
 const availableStreams = ref<StreamConfig[]>([])
 const currentStreamId = ref<string | null>(null)
-const isMultiStreamMode = ref(false)
+const isMultiStreamMode = ref(true) // 统一使用多流模式
 const streamLoadingStates = reactive<Record<string, boolean>>({})
 
 // 轮播相关
@@ -236,10 +295,17 @@ const carouselScrollLeft = ref(0)
 const maxScrollLeft = ref(0)
 const thumbnailRefs = reactive<Record<string, HTMLVideoElement>>({})
 
+// 新增：配置和监控相关
+const globalConfig = ref(getGlobalConfig())
+const playerConfig = ref<PlayerConfig>()
+const reconnectManager = createStandardReconnect()
+const connectionState = ref<ConnectionState>(ConnectionState.DISCONNECTED)
+const monitoringEnabled = ref(props.enableMonitoring)
+
 // 轮播配置
-const THUMBNAIL_WIDTH = 160 // 缩略图宽度
-const THUMBNAIL_GAP = 12 // 缩略图间距
-const SCROLL_STEP = THUMBNAIL_WIDTH + THUMBNAIL_GAP // 滚动步长
+const THUMBNAIL_WIDTH = 160
+const THUMBNAIL_GAP = 12
+const SCROLL_STEP = THUMBNAIL_WIDTH + THUMBNAIL_GAP
 
 // WebRTC 相关
 let webrtcPlayer: any = null
@@ -252,10 +318,69 @@ const streamPlayers = new Map<string, any>()
 
 // 计算属性
 const playerStyle = computed(() => ({
-  width: typeof props.config.width === 'number' ? `${props.config.width}px` : props.config.width,
-  height: typeof props.config.height === 'number' ? `${props.config.height}px` : props.config.height
+  width: `${globalConfig.value.defaultWidth}px`,
+  height: `${globalConfig.value.defaultHeight}px`
 }))
 
+// 监听重连状态
+reconnectManager.on('stateChange', (newState: ConnectionState) => {
+  connectionState.value = newState
+})
+
+reconnectManager.on('attempt', (event: any) => {
+  console.log(`重连尝试 ${event.attempt}/${globalConfig.value.maxRetries}`)
+  if (monitoringEnabled.value) {
+    globalMonitor.recordEvent('network', { 
+      action: 'reconnect_attempt', 
+      attempt: event.attempt 
+    }, currentStreamId.value || undefined)
+  }
+})
+
+// 初始化配置
+const initializeConfig = () => {
+  try {
+    // 应用预设配置
+    playerConfig.value = playerConfigManager.applyPreset(props.preset || 'multiStream')
+    
+    // 如果有streams prop，创建多流配置
+    if (props.streams && props.streams.length > 0) {
+      const multiConfig = createMultiStreamConfig(props.streams)
+      availableStreams.value = multiConfig.streams
+      
+      // 设置第一个流为当前流
+      if (availableStreams.value.length > 0) {
+        currentStreamId.value = availableStreams.value[0].id
+      }
+    }
+    
+    // 更新全局配置
+    globalConfig.value = getGlobalConfig()
+    
+  } catch (error) {
+    console.error('配置初始化失败:', error)
+    recordError(error as Error, 'unknown', currentStreamId.value || undefined)
+  }
+}
+
+const getCurrentStream = () => {
+  if (!currentStreamId.value) return null
+  return availableStreams.value.find(s => s.id === currentStreamId.value) || null
+}
+
+const getCurrentStreamType = () => {
+  const s = getCurrentStream()
+  return s?.type
+}
+
+const getCurrentStreamPlayConfig = (): PlayerConfig => {
+  const s = getCurrentStream()
+  return {
+    ...playerConfig.value!,
+    url: s?.url || '',
+    type: s?.type
+  }
+}
 // 播放器实例
 const playerInstance: IPlayer = {
   async play() {
@@ -312,64 +437,293 @@ const playerInstance: IPlayer = {
   },
   removeStream(streamId: string) {
     removeStream(streamId)
+  },
+  
+  // 新增方法
+  getMonitorReport() {
+    return globalMonitor.getReport(currentStreamId.value || undefined)
+  },
+  
+  getConnectionState() {
+    return connectionState.value
+  },
+  
+  updatePreset(presetName: string) {
+    try {
+      playerConfig.value = playerConfigManager.applyPreset(presetName)
+      refresh() // 重新加载以应用新配置
+    } catch (error) {
+      console.error('更新预设失败:', error)
+    }
+  },
+  
+  exportConfig() {
+    return playerConfigManager.exportConfig()
   }
 }
 
-// 暴露播放器实例
-defineExpose(playerInstance)
+// 多流管理函数 - 需要在defineExpose之前定义
+const switchToStream = async (streamId: string) => {
+  const targetStream = availableStreams.value.find(stream => stream.id === streamId)
+  if (!targetStream) {
+    throw new Error(`未找到ID为 ${streamId} 的视频流`)
+  }
+
+  // 如果已经是当前流，直接返回
+  if (currentStreamId.value === streamId) {
+    return
+  }
+
+  // 设置轮播加载状态
+  streamLoadingStates[streamId] = true
+
+  // 保存当前播放器实例
+  if (currentStreamId.value) {
+    const currentPlayer = getCurrentPlayerInstance()
+    if (currentPlayer) {
+      streamPlayers.set(currentStreamId.value, currentPlayer)
+    }
+  }
+
+  // 停止当前播放但不销毁实例
+  stopCurrentStream()
+  
+  // 更新当前流ID
+  const previousStreamId = currentStreamId.value
+  currentStreamId.value = streamId
+  
+  try {
+    status.value = PlayerStatus.LOADING
+    console.log(`多流切换: 开始切换到流 ${streamId}, 类型: ${targetStream.type}`)
+    
+    // 检查是否已有该流的播放器实例
+    const existingPlayer = streamPlayers.get(streamId)
+    if (existingPlayer) {
+      console.log(`多流切换: 复用已有播放器实例 ${streamId}`)
+      // 复用已有实例
+      Object.assign(playerInstance, existingPlayer)
+      status.value = PlayerStatus.PLAYING
+      streamLoadingStates[streamId] = false
+      
+      // 记录监控事件
+      globalMonitor.recordEvent({
+        type: 'stream_switch',
+        streamId,
+        timestamp: Date.now(),
+        data: { from: previousStreamId, to: streamId, reused: true }
+      })
+      
+      props.events?.onStreamSwitch?.(streamId, targetStream)
+      return
+    }
+
+    // 创建新的播放器配置
+    const streamConfig = {
+      ...targetStream,
+      ...globalConfig.value,
+      events: {
+        ...props.events,
+        onPlay: () => {
+          status.value = PlayerStatus.PLAYING
+          streamLoadingStates[streamId] = false
+          console.log(`多流播放: 流 ${streamId} 开始播放`)
+          
+          // 记录监控事件
+          globalMonitor.recordEvent({
+            type: 'stream_switch',
+            streamId,
+            timestamp: Date.now(),
+            data: { from: previousStreamId, to: streamId, reused: false }
+          })
+          
+          props.events?.onPlay?.()
+          props.events?.onStreamSwitch?.(streamId, targetStream)
+        },
+        onError: async (error: any) => {
+          status.value = PlayerStatus.ERROR
+          streamLoadingStates[streamId] = false
+          console.error(`多流播放错误: 流 ${streamId}`, error)
+          
+          // 记录错误
+          globalMonitor.recordError(error, streamId)
+          
+          // 尝试重连
+          if (globalConfig.value.autoReconnect) {
+             reconnectManager.connect(async () => {
+              await playStreamByConfig(streamConfig)
+            })
+          }
+          
+          props.events?.onError?.(error)
+        }
+      }
+    }
+
+    // 开始播放新流
+    await playStreamByConfig(streamConfig)
+    
+  } catch (error) {
+    console.error(`多流切换失败: ${streamId}`, error)
+    status.value = PlayerStatus.ERROR
+    streamLoadingStates[streamId] = false
+    
+    // 记录错误
+    globalMonitor.recordError(error, streamId)
+    
+    // 回滚到之前的流
+    if (previousStreamId) {
+      currentStreamId.value = previousStreamId
+    }
+    
+    throw error
+  }
+}
+
+const addStream = (stream: StreamConfig) => {
+  // 检查是否已存在相同ID的流
+  const existingIndex = availableStreams.value.findIndex(s => s.id === stream.id)
+  if (existingIndex !== -1) {
+    // 更新现有流
+    availableStreams.value[existingIndex] = stream
+    console.log(`多流管理: 更新流 ${stream.id}`)
+  } else {
+    // 添加新流
+    availableStreams.value.push(stream)
+    console.log(`多流管理: 添加新流 ${stream.id}`)
+  }
+  
+  // 记录监控事件
+  globalMonitor.recordEvent({
+    type: 'stream_added',
+    streamId: stream.id,
+    timestamp: Date.now(),
+    data: stream
+  })
+}
+
+const removeStream = (streamId: string) => {
+  const index = availableStreams.value.findIndex(s => s.id === streamId)
+  if (index === -1) {
+    console.warn(`多流管理: 未找到要删除的流 ${streamId}`)
+    return
+  }
+
+  // 如果要删除的是当前播放的流
+  if (currentStreamId.value === streamId) {
+    // 停止播放
+    stopCurrentStream()
+    
+    // 如果还有其他流，切换到第一个
+    const remainingStreams = availableStreams.value.filter(s => s.id !== streamId)
+    if (remainingStreams.length > 0) {
+      switchToStream(remainingStreams[0].id).catch(console.error)
+    } else {
+      currentStreamId.value = null
+    }
+  }
+
+  // 清理播放器实例
+  streamPlayers.delete(streamId)
+  delete streamLoadingStates[streamId]
+  
+  // 从列表中移除
+  availableStreams.value.splice(index, 1)
+  console.log(`多流管理: 删除流 ${streamId}`)
+  
+  // 记录监控事件
+  globalMonitor.recordEvent({
+    type: 'stream_removed',
+    streamId,
+    timestamp: Date.now(),
+    data: { remainingCount: availableStreams.value.length }
+  })
+}
+
+// 暴露给父组件的方法
+defineExpose({
+  ...playerInstance,
+  // 多流管理方法
+  switchStream: switchToStream,
+  addStream,
+  removeStream,
+  getAvailableStreams: () => availableStreams.value,
+  getCurrentStreamId: () => currentStreamId.value,
+  getConnectionState: () => connectionState.value,
+  
+  // 配置管理方法
+  updateGlobalConfig: (config: Partial<typeof globalConfig.value>) => {
+    Object.assign(globalConfig.value, config)
+    playerConfigManager.updateGlobalConfig(config)
+  },
+  
+  // 监控方法
+  getMonitoringData: () => globalMonitor.getReport(currentStreamId.value || undefined),
+  exportMonitoringData: () => globalMonitor.exportData(),
+  
+  // 重连管理
+  forceReconnect: async () => await reconnectManager.connect(async () => {
+    await playStreamByConfig(getCurrentStreamPlayConfig())
+  }),
+  stopReconnect: () => reconnectManager.stopReconnect()
+})
 
 // 事件处理
 const handleLoadStart = () => {
-  console.log('视频元素: loadstart事件, 当前类型:', props.config.type)
   status.value = PlayerStatus.LOADING
   props.events?.onLoadStart?.()
+  emit('loadStart')
 }
 
 const handleLoadedData = () => {
-  console.log('视频元素: loadeddata事件, 当前类型:', props.config.type, '当前状态:', status.value)
-  // 对于WebRTC类型的播放，不要重置状态为IDLE
-  // 因为WebRTC的状态由其自己的事件管理
-  if (props.config.type !== StreamType.WEBRTC && props.config.type !== StreamType.ZLM_RTC) {
-    console.log('视频元素: 非WebRTC类型，设置状态为IDLE')
+  if (getCurrentStreamType() !== StreamType.WEBRTC && getCurrentStreamType() !== StreamType.ZLM_RTC) {
     status.value = PlayerStatus.IDLE
-  } else {
-    console.log('视频元素: WebRTC类型，保持当前状态:', status.value)
   }
   props.events?.onLoadEnd?.()
+  emit('loadEnd')
 }
 
 const handlePlay = () => {
-  console.log('视频元素: play事件, 当前类型:', props.config.type, '当前状态:', status.value)
-  // 对于WebRTC类型，状态由其自己的事件管理
-  // 但如果当前状态不是PLAYING，则更新状态
-  if (props.config.type !== StreamType.WEBRTC && props.config.type !== StreamType.ZLM_RTC) {
-    console.log('视频元素: 非WebRTC类型，设置状态为PLAYING')
+  if (getCurrentStreamType() !== StreamType.WEBRTC && getCurrentStreamType() !== StreamType.ZLM_RTC) {
     status.value = PlayerStatus.PLAYING
     props.events?.onPlay?.()
+    emit('play')
   } else if (status.value !== PlayerStatus.PLAYING) {
-    console.log('视频元素: WebRTC类型但状态不是PLAYING，触发onPlay事件')
     props.events?.onPlay?.()
-  } else {
-    console.log('视频元素: WebRTC类型且状态已是PLAYING')
+    emit('play')
   }
 }
 
 const handlePause = () => {
   status.value = PlayerStatus.PAUSED
   props.events?.onPause?.()
+  emit('pause')
 }
 
-const handleError = (event: Event) => {
+const handleError = async (event: Event) => {
   status.value = PlayerStatus.ERROR
+  connectionState.value = ConnectionState.FAILED
   const error = new Error('视频播放错误')
   errorMessage.value = error.message
+  
+  if (monitoringEnabled.value) {
+    recordError(error, 'video_element', currentStreamId.value || undefined)
+  }
+  
   props.events?.onError?.(error)
+  emit('error', error)
+  
+  if (props.enableAutoReconnect) {
+    reconnectManager.connect(async () => {
+      await playStreamByConfig(getCurrentStreamPlayConfig())
+    })
+  }
 }
 
 const handleTimeUpdate = () => {
   if (videoElement.value) {
     currentTime.value = videoElement.value.currentTime
     props.events?.onTimeUpdate?.(currentTime.value)
+    emit('timeUpdate', currentTime.value)
   }
 }
 
@@ -385,6 +739,7 @@ const handleVolumeChange = () => {
     }
     isMuted.value = videoElement.value.muted
     props.events?.onVolumeChange?.(volume.value)
+    emit('volumeChange', volume.value)
   }
 }
 
@@ -393,14 +748,36 @@ const play = async () => {
   try {
     status.value = PlayerStatus.LOADING
     
-    // 初始化多视频流
-    initializeMultiStream()
+    // 初始化配置
+    initializeConfig()
     
-    if (isMultiStreamMode.value && currentStreamId.value) {
+    // 启动监控
+    if (monitoringEnabled.value) {
+      startMonitoring()
+    }
+    
+    if (currentStreamId.value) {
       const currentStream = availableStreams.value.find(s => s.id === currentStreamId.value)
       if (currentStream) {
+        // 记录播放开始事件
+        if (monitoringEnabled.value) {
+          globalMonitor.recordEvent('playback', { 
+            action: 'play_start',
+            streamType: currentStream.type
+          }, currentStreamId.value)
+        }
+        
+        // 设置重连管理器
+        if (props.enableAutoReconnect) {
+          reconnectManager.updateConfig({
+            maxRetries: globalConfig.value.maxRetries,
+            initialDelay: globalConfig.value.retryDelay,
+            backoffFactor: globalConfig.value.backoffMultiplier
+          })
+        }
+        
         await playStreamByConfig({
-          ...props.config,
+          ...playerConfig.value!,
           url: currentStream.url,
           type: currentStream.type
         })
@@ -408,31 +785,27 @@ const play = async () => {
         throw new Error('未找到可播放的视频流')
       }
     } else {
-      // 单流模式
-      switch (props.config.type) {
-        case StreamType.WEBRTC:
-          await playWebRTC()
-          break
-        case StreamType.ZLM_RTC:
-          await playZLMRTC()
-          break
-        case StreamType.RTMP:
-        case StreamType.RTSP:
-        case StreamType.GB28181:
-          await playStreaming()
-          break
-        case StreamType.HLS:
-        case StreamType.FLV:
-          await playNative()
-          break
-        default:
-          throw new Error(`不支持的视频流类型: ${props.config.type}`)
-      }
+      throw new Error('没有可用的视频流')
     }
   } catch (error) {
     status.value = PlayerStatus.ERROR
     errorMessage.value = error instanceof Error ? error.message : '播放失败'
-    props.events?.onError?.(error instanceof Error ? error : new Error('播放失败'))
+    
+    // 记录错误
+    if (monitoringEnabled.value) {
+      recordError(error as Error, 'unknown', currentStreamId.value || undefined)
+    }
+    
+    // 尝试自动重连
+    if (props.enableAutoReconnect && connectionState.value !== ConnectionState.RECONNECTING) {
+      await reconnectManager.connect(async () => {
+        await playStreamByConfig(getCurrentStreamPlayConfig())
+      })
+    }
+    
+    const err = error instanceof Error ? error : new Error('播放失败')
+    props.events?.onError?.(err)
+    emit('error', err)
   }
 }
 
@@ -463,24 +836,53 @@ const playWebRTC = async (config?: PlayerConfig) => {
   }
   
   // 监听连接状态变化
-  webrtcPlayer.pc.onconnectionstatechange = () => {
+  webrtcPlayer.pc.onconnectionstatechange = async () => {
     console.log('WebRTC连接状态:', webrtcPlayer.pc.connectionState)
-    if (webrtcPlayer.pc.connectionState === 'connected') {
+    const state = webrtcPlayer.pc.connectionState
+    
+    if (monitoringEnabled.value) {
+      globalMonitor.recordEvent('network', { 
+        action: 'connection_state_change', 
+        state 
+      }, currentStreamId.value || undefined)
+    }
+    
+    if (state === 'connected') {
       status.value = PlayerStatus.PLAYING
-    } else if (webrtcPlayer.pc.connectionState === 'failed') {
+      connectionState.value = ConnectionState.CONNECTED
+      reconnectManager.reset()
+    } else if (state === 'failed') {
       status.value = PlayerStatus.ERROR
-      emitEvent('onError', new Error('WebRTC连接失败'))
+      connectionState.value = ConnectionState.FAILED
+      const err = new Error('WebRTC连接失败')
+      props.events?.onError?.(err)
+      emit('error', err)
+      
+      if (props.enableAutoReconnect) {
+        await reconnectManager.connect(async () => {
+          await playStreamByConfig(getCurrentStreamPlayConfig())
+        })
+      }
     }
   }
   
   try {
     const playUrl = config?.url || getCurrentPlayUrl()
+    connectionState.value = ConnectionState.CONNECTING
     await webrtcPlayer.play(playUrl)
     console.log('WebRTC播放请求已发送')
   } catch (error) {
     console.error('WebRTC播放失败:', error)
     status.value = PlayerStatus.ERROR
-    emitEvent('onError', error)
+    connectionState.value = ConnectionState.FAILED
+    
+    if (monitoringEnabled.value) {
+      recordError(error as Error, 'webrtc', currentStreamId.value || undefined)
+    }
+    
+    const err = error instanceof Error ? error : new Error('WebRTC播放失败')
+    props.events?.onError?.(err)
+    emit('error', err)
     throw error
   }
 }
@@ -510,11 +912,11 @@ const playZLMRTC = async (config?: PlayerConfig) => {
     debug: false,
     zlmsdpUrl: playUrl,
     simulcast: false,
-    useCamera: false,
-    audioEnable: true,
-    videoEnable: true,
-    recvOnly: true,
-    resolution: { w: 1280, h: 720 },
+    useCamera: false, // 不使用摄像头
+    audioEnable: false, // 接收模式下不启用音频发送
+    videoEnable: false, // 接收模式下不启用视频发送  
+    recvOnly: true, // 纯接收模式，不发送任何媒体流，避免媒体捕获
+    resolution: { w: globalConfig.value.defaultWidth, h: globalConfig.value.defaultHeight },
     usedatachannel: false,
     videoId: '',
     audioId: '',
@@ -606,10 +1008,21 @@ const playZLMRTC = async (config?: PlayerConfig) => {
     }, 2000)
   })
   
-  zlmRtcPlayer.on(window.ZLMRTCClient.Events.WEBRTC_ON_CONNECTION_STATE_CHANGE, (state: any) => {
+  zlmRtcPlayer.on(window.ZLMRTCClient.Events.WEBRTC_ON_CONNECTION_STATE_CHANGE, async (state: any) => {
     console.log('ZLM RTC: 连接状态变化', state)
+    
+    if (monitoringEnabled.value) {
+      globalMonitor.recordEvent('network', { 
+        action: 'connection_state_change', 
+        state 
+      }, currentStreamId.value || undefined)
+    }
+    
     if (state === 'connected') {
       console.log('ZLM RTC: 连接已建立')
+      connectionState.value = ConnectionState.CONNECTED
+      reconnectManager.reset()
+      
       // 连接成功后，检查视频元素是否已有流
       setTimeout(() => {
         if (videoElement.value && videoElement.value.srcObject) {
@@ -622,8 +1035,21 @@ const playZLMRTC = async (config?: PlayerConfig) => {
     } else if (state === 'failed' || state === 'disconnected') {
       console.log('ZLM RTC: 连接失败或断开', state)
       status.value = PlayerStatus.ERROR
+      connectionState.value = ConnectionState.FAILED
       errorMessage.value = '连接断开'
-      props.events?.onError?.(new Error(`连接状态: ${state}`))
+      
+      const error = new Error(`连接状态: ${state}`)
+      if (monitoringEnabled.value) {
+        recordError(error, 'zlm_rtc', currentStreamId.value || undefined)
+      }
+      
+      props.events?.onError?.(error)
+      
+      if (props.enableAutoReconnect) {
+        await reconnectManager.connect(async () => {
+          await playStreamByConfig(getCurrentStreamPlayConfig())
+        })
+      }
     }
   })
 
@@ -652,6 +1078,7 @@ const playZLMRTC = async (config?: PlayerConfig) => {
   // 清除之前的错误状态
   errorMessage.value = ''
   status.value = PlayerStatus.LOADING
+  connectionState.value = ConnectionState.CONNECTING
   
   try {
     await zlmRtcPlayer.start()
@@ -665,40 +1092,109 @@ const playZLMRTC = async (config?: PlayerConfig) => {
   } catch (error) {
     console.error('ZLM RTC: 连接启动失败', error)
     status.value = PlayerStatus.ERROR
+    connectionState.value = ConnectionState.FAILED
     errorMessage.value = error instanceof Error ? error.message : 'ZLM RTC连接失败'
+    
+    if (monitoringEnabled.value) {
+      recordError(error as Error, 'zlm_rtc', currentStreamId.value || undefined)
+    }
+    
     props.events?.onError?.(error instanceof Error ? error : new Error('ZLM RTC连接失败'))
+    
+    if (props.enableAutoReconnect) {
+      await reconnectManager.connect(async () => {
+        await playStreamByConfig(getCurrentStreamPlayConfig())
+      })
+    }
+    
     throw error
   }
 }
 
 const playStreaming = async (config?: PlayerConfig) => {
-  await loadScript('/vendors/jswebrtc.min.js')
-  
-  if (!window.jswebrtc) {
-    throw new Error('jswebrtc 库加载失败')
+  try {
+    const playUrl = config?.url || getCurrentPlayUrl()
+    if (!playUrl) {
+      throw new Error('播放地址不能为空')
+    }
+
+    connectionState.value = ConnectionState.CONNECTING
+    
+    // 这里可以集成其他流媒体播放器，如 flv.js, hls.js 等
+    if (videoElement.value) {
+      videoElement.value.src = playUrl
+      await videoElement.value.play()
+      status.value = PlayerStatus.PLAYING
+      connectionState.value = ConnectionState.CONNECTED
+      
+      if (monitoringEnabled.value) {
+        globalMonitor.recordEvent('playback', { 
+          action: 'streaming_play_success',
+          url: playUrl
+        }, currentStreamId.value || undefined)
+      }
+    }
+  } catch (error) {
+    console.error('流媒体播放失败:', error)
+    status.value = PlayerStatus.ERROR
+    connectionState.value = ConnectionState.FAILED
+    
+    if (monitoringEnabled.value) {
+      recordError(error as Error, 'streaming', currentStreamId.value || undefined)
+    }
+    
+    props.events?.onError?.(error instanceof Error ? error : new Error('流媒体播放失败'))
+    
+    if (props.enableAutoReconnect) {
+      await reconnectManager.connect(async () => {
+        await playStreamByConfig(getCurrentStreamPlayConfig())
+      })
+    }
+    
+    throw error
   }
-  
-  if (jswebrtcPlayer) {
-    jswebrtcPlayer.destroy()
-  }
-  
-  const playUrl = config?.url || getCurrentPlayUrl()
-  
-  jswebrtcPlayer = new window.jswebrtc.Player({
-    element: videoElement.value,
-    url: playUrl
-  })
-  
-  await jswebrtcPlayer.play()
-  status.value = PlayerStatus.PLAYING
 }
 
 const playNative = async (config?: PlayerConfig) => {
-  if (videoElement.value) {
+  try {
     const playUrl = config?.url || getCurrentPlayUrl()
-    videoElement.value.src = playUrl
-    await videoElement.value.play()
-    status.value = PlayerStatus.PLAYING
+    if (!playUrl) {
+      throw new Error('播放地址不能为空')
+    }
+
+    connectionState.value = ConnectionState.CONNECTING
+    
+    if (videoElement.value) {
+      videoElement.value.src = playUrl
+      await videoElement.value.play()
+      status.value = PlayerStatus.PLAYING
+      connectionState.value = ConnectionState.CONNECTED
+      
+      if (monitoringEnabled.value) {
+        globalMonitor.recordEvent('playback', { 
+          action: 'native_play_success',
+          url: playUrl
+        }, currentStreamId.value || undefined)
+      }
+    }
+  } catch (error) {
+    console.error('原生播放失败:', error)
+    status.value = PlayerStatus.ERROR
+    connectionState.value = ConnectionState.FAILED
+    
+    if (monitoringEnabled.value) {
+      recordError(error as Error, 'native', currentStreamId.value || undefined)
+    }
+    
+    props.events?.onError?.(error instanceof Error ? error : new Error('原生播放失败'))
+    
+    if (props.enableAutoReconnect) {
+      await reconnectManager.connect(async () => {
+        await playStreamByConfig(getCurrentStreamPlayConfig())
+      })
+    }
+    
+    throw error
   }
 }
 
@@ -887,9 +1383,17 @@ const setThumbnailRef = (streamId: string, el: HTMLVideoElement | null) => {
 }
 
 const scrollCarousel = (direction: 'left' | 'right') => {
+  if (!carouselWrapper.value) return
+  
+  const currentScroll = carouselScrollLeft.value
   const step = direction === 'left' ? -SCROLL_STEP : SCROLL_STEP
-  const newScrollLeft = Math.max(0, Math.min(maxScrollLeft.value, carouselScrollLeft.value + step))
-  carouselScrollLeft.value = newScrollLeft
+  const newScroll = Math.max(0, Math.min(currentScroll + step, maxScrollLeft.value))
+  
+  carouselScrollLeft.value = newScroll
+  carouselWrapper.value.scrollTo({
+    left: newScroll,
+    behavior: 'smooth'
+  })
 }
 
 const updateCarouselScrollLimits = () => {
@@ -899,6 +1403,46 @@ const updateCarouselScrollLimits = () => {
     maxScrollLeft.value = Math.max(0, trackWidth - wrapperWidth)
   }
 }
+
+// 更新轮播布局
+const updateCarouselLayout = () => {
+  nextTick(() => {
+    if (carouselTrack.value) {
+      const totalWidth = availableStreams.value.length * (THUMBNAIL_WIDTH + THUMBNAIL_GAP)
+      const containerWidth = carouselWrapper.value?.clientWidth || 0
+      maxScrollLeft.value = Math.max(0, totalWidth - containerWidth)
+    }
+  })
+}
+
+// 更新轮播位置
+const updateCarouselPosition = () => {
+  if (!currentStreamId.value || !carouselWrapper.value) return
+  
+  const currentIndex = availableStreams.value.findIndex(s => s.id === currentStreamId.value)
+  if (currentIndex === -1) return
+  
+  const targetPosition = currentIndex * SCROLL_STEP
+  const containerWidth = carouselWrapper.value.clientWidth
+  const maxScroll = maxScrollLeft.value
+  
+  // 计算最佳滚动位置，确保当前项可见
+  let scrollPosition = targetPosition - (containerWidth / 2) + (THUMBNAIL_WIDTH / 2)
+  scrollPosition = Math.max(0, Math.min(scrollPosition, maxScroll))
+  
+  carouselScrollLeft.value = scrollPosition
+  carouselWrapper.value.scrollTo({
+    left: scrollPosition,
+    behavior: 'smooth'
+  })
+}
+
+// 处理轮播滚动
+const handleCarouselScroll = debounce(() => {
+  if (carouselWrapper.value) {
+    carouselScrollLeft.value = carouselWrapper.value.scrollLeft
+  }
+}, 16)
 
 
 
@@ -930,161 +1474,49 @@ const resetHideTimer = debounce(() => {
 
 // 获取当前播放URL的辅助函数
 const getCurrentPlayUrl = () => {
-  if (isMultiStreamMode.value && currentStreamId.value) {
-    const currentStream = availableStreams.value.find(s => s.id === currentStreamId.value)
-    return currentStream?.url || props.config.url
-  }
-  return props.config.url
-}
-
-// 多视频流管理函数
-const initializeMultiStream = () => {
-  if (props.config.enableMultiStream && props.config.multiStream) {
-    isMultiStreamMode.value = true
-    availableStreams.value = props.config.multiStream.streams.filter(stream => stream.enabled !== false)
-    
-    // 设置默认流
-    if (props.config.multiStream.defaultStreamId) {
-      currentStreamId.value = props.config.multiStream.defaultStreamId
-    } else if (availableStreams.value.length > 0) {
-      currentStreamId.value = availableStreams.value[0].id
-    }
-  } else if (props.config.url && props.config.type) {
-    // 单流模式
-    isMultiStreamMode.value = false
-    availableStreams.value = [{
-      id: 'default',
-      name: '默认流',
-      url: props.config.url,
-      type: props.config.type,
-      enabled: true
-    }]
-    currentStreamId.value = 'default'
-  }
-}
-
-const switchToStream = async (streamId: string) => {
-  const targetStream = availableStreams.value.find(stream => stream.id === streamId)
-  if (!targetStream) {
-    throw new Error(`未找到ID为 ${streamId} 的视频流`)
-  }
-
-  // 如果已经是当前流，直接返回
-  if (currentStreamId.value === streamId) {
-    return
-  }
-
-  // 设置轮播加载状态
-  streamLoadingStates[streamId] = true
-
-  // 保存当前播放器实例
   if (currentStreamId.value) {
-    const currentPlayer = getCurrentPlayerInstance()
-    if (currentPlayer) {
-      streamPlayers.set(currentStreamId.value, currentPlayer)
-    }
+    const currentStream = availableStreams.value.find(s => s.id === currentStreamId.value)
+    return currentStream?.url || ''
   }
-
-  // 停止当前播放但不销毁实例
-  stopCurrentStream()
-  
-  // 更新当前流ID
-  const previousStreamId = currentStreamId.value
-  currentStreamId.value = streamId
-  
-  try {
-    status.value = PlayerStatus.LOADING
-    console.log(`多流切换: 开始切换到流 ${streamId}, 类型: ${targetStream.type}`)
-    
-    // 检查是否已有该流的播放器实例
-    if (streamPlayers.has(streamId)) {
-      const existingPlayer = streamPlayers.get(streamId)
-      console.log(`多流切换: 找到已存在的播放器实例 ${streamId}`)
-      if (existingPlayer && await resumePlayerInstance(existingPlayer, targetStream)) {
-        status.value = PlayerStatus.PLAYING
-        streamLoadingStates[streamId] = false
-        props.events?.onStreamSwitch?.(streamId)
-        console.log(`多流切换: 成功恢复播放器实例 ${streamId}`)
-        return
-      }
-    }
-    
-    // 创建新的播放器实例
-    console.log(`多流切换: 创建新的播放器实例 ${streamId}, 类型: ${targetStream.type}`)
-    await createNewPlayerInstance(targetStream)
-    streamLoadingStates[streamId] = false
-    props.events?.onStreamSwitch?.(streamId)
-    console.log(`多流切换: 成功创建并切换到流 ${streamId}`)
-    
-  } catch (error) {
-    // 切换失败，回滚到之前的流
-    currentStreamId.value = previousStreamId
-    streamLoadingStates[streamId] = false
-    status.value = PlayerStatus.ERROR
-    errorMessage.value = error instanceof Error ? error.message : '切换视频流失败'
-    props.events?.onError?.(error instanceof Error ? error : new Error('切换视频流失败'))
-  }
+  return ''
 }
 
 const playStreamByConfig = async (config: PlayerConfig) => {
-  switch (config.type) {
-    case StreamType.WEBRTC:
-      await playWebRTC(config)
-      break
-    case StreamType.ZLM_RTC:
-      await playZLMRTC(config)
-      break
-    case StreamType.RTMP:
-    case StreamType.RTSP:
-    case StreamType.GB28181:
-      await playStreaming(config)
-      break
-    case StreamType.HLS:
-    case StreamType.FLV:
-      await playNative(config)
-      break
-    default:
-      throw new Error(`不支持的视频流类型: ${config.type}`)
-  }
-}
-
-const addStream = (stream: StreamConfig) => {
-  const existingIndex = availableStreams.value.findIndex(s => s.id === stream.id)
-  if (existingIndex >= 0) {
-    availableStreams.value[existingIndex] = stream
-  } else {
-    availableStreams.value.push(stream)
-  }
-}
-
-const removeStream = (streamId: string) => {
-  const index = availableStreams.value.findIndex(s => s.id === streamId)
-  if (index >= 0) {
-    availableStreams.value.splice(index, 1)
-    
-    // 清理该流的播放器实例
-    if (streamPlayers.has(streamId)) {
-      const player = streamPlayers.get(streamId)
-      if (player) {
-        // 对于ZLM RTC实例，使用close方法
-        if (typeof player.close === 'function') {
-          try {
-            player.close()
-            console.log('ZLM RTC: 实例已清理', streamId)
-          } catch (error) {
-            console.warn('ZLM RTC: 清理实例失败', error)
-          }
-        } else if (typeof player.destroy === 'function') {
-          player.destroy()
-        }
-      }
-      streamPlayers.delete(streamId)
+  try {
+    // 记录播放开始
+    if (monitoringEnabled.value) {
+      globalMonitor.recordEvent('playback', { 
+        action: 'stream_start',
+        streamType: config.type,
+        url: config.url
+      }, currentStreamId.value || undefined)
     }
-    
-    // 如果删除的是当前播放的流，切换到第一个可用流
-    if (currentStreamId.value === streamId && availableStreams.value.length > 0) {
-      switchToStream(availableStreams.value[0].id)
+
+    switch (config.type) {
+      case StreamType.WEBRTC:
+        await playWebRTC(config)
+        break
+      case StreamType.ZLM_RTC:
+        await playZLMRTC(config)
+        break
+      case StreamType.RTMP:
+      case StreamType.RTSP:
+      case StreamType.GB28181:
+        await playStreaming(config)
+        break
+      case StreamType.HLS:
+      case StreamType.FLV:
+        await playNative(config)
+        break
+      default:
+        throw new Error(`不支持的视频流类型: ${config.type}`)
     }
+  } catch (error) {
+    console.error('播放流失败:', error)
+    if (monitoringEnabled.value) {
+      recordError(error as Error, config.type, currentStreamId.value || undefined)
+    }
+    throw error
   }
 }
 
@@ -1213,21 +1645,31 @@ const destroy = () => {
 }
 
 // 监听配置变化
-watch(() => props.config, (newConfig) => {
-  // 重新初始化多流模式
-  initializeMultiStream()
-  
-  if (status.value !== PlayerStatus.IDLE) {
-    stop()
-    nextTick(() => {
-      play()
-    })
+watch(() => props.streams, (newStreams) => {
+  if (newStreams && newStreams.length > 0) {
+    const multiConfig = createMultiStreamConfig(newStreams)
+    availableStreams.value = multiConfig.streams
+    
+    if (availableStreams.value.length > 0 && !currentStreamId.value) {
+      currentStreamId.value = availableStreams.value[0].id
+    }
+    
+    if (status.value !== PlayerStatus.IDLE) {
+      stop()
+      nextTick(() => {
+        play()
+      })
+    }
   }
 }, { deep: true })
 
 // 生命周期
 onMounted(() => {
-  if (props.config.autoplay) {
+  // 初始化配置
+  initializeConfig()
+  
+  // 自动播放
+  if (globalConfig.value.autoplay && availableStreams.value.length > 0) {
     play()
   }
   
@@ -1241,6 +1683,14 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  // 停止监控
+  if (monitoringEnabled.value) {
+    stopMonitoring()
+  }
+  
+  // 停止重连
+  reconnectManager.stopReconnect()
+  
   destroy()
 })
 </script>
@@ -1279,6 +1729,20 @@ video {
   background: rgba(0, 0, 0, 0.8);
   color: white;
   z-index: 10;
+}
+
+.custom-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.custom-overlay > * {
+  pointer-events: auto;
 }
 
 .loading-spinner {
@@ -1440,11 +1904,19 @@ video {
 
 /* 视频流轮播样式 */
 .stream-carousel {
-  position: relative;
-  background: rgba(0, 0, 0, 0.05);
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  position: absolute;
+  bottom: 60px; /* 在控制栏上方 */
+  left: 0;
+  right: 0;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.8));
   padding: 16px;
-  margin-top: 8px;
+  z-index: 15; /* 在视频上方，但在控制栏下方 */
+  transition: opacity 0.3s ease;
+  opacity: 0;
+}
+
+.stream-carousel.carousel-visible {
+  opacity: 1;
 }
 
 .carousel-container {
@@ -1511,11 +1983,17 @@ video {
   cursor: pointer;
   border: 2px solid transparent;
   transition: all 0.2s ease;
+  background: rgba(0, 0, 0, 0.6);
 }
 
 .stream-thumbnail:hover {
   transform: scale(1.05);
-  border-color: rgba(255, 255, 255, 0.3);
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
+.stream-thumbnail.active {
+  border-color: #007bff;
+  box-shadow: 0 0 8px rgba(0, 123, 255, 0.5);
 }
 
 .stream-thumbnail.active {
@@ -1566,37 +2044,60 @@ video {
   background: rgba(0, 123, 255, 0.3);
 }
 
+.thumbnail-container {
+  position: relative;
+  width: 100%;
+  height: calc(100% - 20px); /* 为名称预留空间 */
+}
+
 .thumbnail-status {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+  position: absolute;
+  bottom: 4px;
+  left: 4px;
+  right: 4px;
   font-size: 10px;
   color: white;
-}
-
-.status-indicator {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #28a745;
-}
-
-.status-indicator.loading {
-  background: #ffc107;
-  animation: pulse 1.5s infinite;
-}
-
-.status-indicator.error {
-  background: #dc3545;
+  background: rgba(0, 0, 0, 0.7);
+  padding: 2px 4px;
+  border-radius: 2px;
+  text-align: center;
 }
 
 .thumbnail-name {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
   font-size: 10px;
   color: white;
+  background: rgba(0, 0, 0, 0.8);
+  padding: 2px 4px;
   text-align: center;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.thumbnail-loading {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: white;
+}
+
+.loading-spinner-small {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top: 2px solid white;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+.default-thumbnail {
+  font-size: 24px;
+  color: rgba(255, 255, 255, 0.7);
 }
 
 .play-indicator {
@@ -1606,13 +2107,14 @@ video {
   transform: translate(-50%, -50%);
   width: 20px;
   height: 20px;
-  background: rgba(0, 123, 255, 0.8);
+  background: rgba(0, 123, 255, 0.9);
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
   color: white;
   font-size: 10px;
+  animation: pulse 2s infinite;
 }
 
 @keyframes pulse {
